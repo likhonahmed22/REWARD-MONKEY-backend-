@@ -1,0 +1,600 @@
+// backend/src/server.js
+// COPY THIS ENTIRE FILE
+
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const { Pool } = require('pg');
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+require('dotenv').config();
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Database connection
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+// Test database connection
+pool.query('SELECT NOW()', (err, res) => {
+  if (err) {
+    console.error('❌ Database connection failed:', err);
+  } else {
+    console.log('✅ Database connected successfully');
+  }
+});
+
+// Middleware
+app.use(helmet());
+app.use(cors());
+app.use(express.json());
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  message: 'Too many requests, please try again later'
+});
+app.use('/api/', limiter);
+
+// Utility functions
+const generateReferralCode = () => {
+  return crypto.randomBytes(4).toString('hex').toUpperCase();
+};
+
+const generateFingerprint = (req) => {
+  const ua = req.headers['user-agent'] || '';
+  const ip = req.ip || req.connection.remoteAddress;
+  return crypto.createHash('sha256').update(`${ua}${ip}`).digest('hex');
+};
+
+// Middleware: Authenticate JWT
+const authenticate = async (req, res, next) => {
+  try {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'No token provided' });
+    
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.userId = decoded.userId;
+    next();
+  } catch (err) {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+};
+
+// Admin middleware
+const authenticateAdmin = async (req, res, next) => {
+  try {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Unauthorized' });
+    
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const admin = await pool.query(
+      'SELECT is_admin FROM users WHERE id = $1',
+      [decoded.userId]
+    );
+    
+    if (!admin.rows[0]?.is_admin) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    
+    req.adminId = decoded.userId;
+    next();
+  } catch (err) {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+};
+
+// ========== HEALTH CHECK ==========
+app.get('/', (req, res) => {
+  res.json({ 
+    status: 'online', 
+    message: 'Reward Money API',
+    version: '1.0.0' 
+  });
+});
+
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'healthy', timestamp: new Date().toISOString() });
+});
+
+// ========== AUTH ROUTES ==========
+
+app.post('/api/auth/telegram', async (req, res) => {
+  try {
+    const { telegram_id, username, referral_code } = req.body;
+    
+    if (!telegram_id) {
+      return res.status(400).json({ error: 'Telegram ID required' });
+    }
+
+    let user = await pool.query('SELECT * FROM users WHERE telegram_id = $1', [telegram_id]);
+    
+    if (user.rows.length === 0) {
+      const newReferralCode = generateReferralCode();
+      
+      await pool.query('BEGIN');
+      
+      const result = await pool.query(
+        `INSERT INTO users (telegram_id, username, referral_code, referred_by_code) 
+         VALUES ($1, $2, $3, $4) RETURNING *`,
+        [telegram_id, username, newReferralCode, referral_code || null]
+      );
+      user = result;
+
+      if (referral_code) {
+        const referrer = await pool.query('SELECT id FROM users WHERE referral_code = $1', [referral_code]);
+        if (referrer.rows.length > 0) {
+          const referrerId = referrer.rows[0].id;
+          const newUserId = result.rows[0].id;
+          
+          await pool.query(
+            'INSERT INTO referrals (referrer_id, referred_user_id, bonus_amount, is_paid) VALUES ($1, $2, 3.00, true)',
+            [referrerId, newUserId]
+          );
+          
+          await pool.query(
+            'UPDATE users SET wallet_balance = wallet_balance + 3.00, total_earned = total_earned + 3.00, total_referrals = total_referrals + 1 WHERE id = $1',
+            [referrerId]
+          );
+          
+          const newBalance = await pool.query('SELECT wallet_balance FROM users WHERE id = $1', [referrerId]);
+          await pool.query(
+            `INSERT INTO transactions (user_id, type, amount, balance_after, reference_id, description) 
+             VALUES ($1, 'referral_bonus', 3.00, $2, $3, 'Referral bonus from new user')`,
+            [referrerId, newBalance.rows[0].wallet_balance, newUserId]
+          );
+        }
+      }
+      
+      await pool.query('COMMIT');
+    } else {
+      await pool.query('UPDATE users SET last_login = NOW() WHERE id = $1', [user.rows[0].id]);
+    }
+
+    const token = jwt.sign({ userId: user.rows[0].id }, process.env.JWT_SECRET, { expiresIn: '30d' });
+    
+    res.json({
+      token,
+      user: user.rows[0]
+    });
+  } catch (err) {
+    await pool.query('ROLLBACK');
+    console.error('Auth error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/auth/device', async (req, res) => {
+  try {
+    const { device_id, referral_code } = req.body;
+    
+    if (!device_id) {
+      return res.status(400).json({ error: 'Device ID required' });
+    }
+
+    let user = await pool.query('SELECT * FROM users WHERE device_id = $1', [device_id]);
+    
+    if (user.rows.length === 0) {
+      const newReferralCode = generateReferralCode();
+      
+      await pool.query('BEGIN');
+      
+      const result = await pool.query(
+        `INSERT INTO users (device_id, referral_code, referred_by_code) 
+         VALUES ($1, $2, $3) RETURNING *`,
+        [device_id, newReferralCode, referral_code || null]
+      );
+      user = result;
+
+      if (referral_code) {
+        const referrer = await pool.query('SELECT id FROM users WHERE referral_code = $1', [referral_code]);
+        if (referrer.rows.length > 0) {
+          const referrerId = referrer.rows[0].id;
+          
+          await pool.query(
+            'INSERT INTO referrals (referrer_id, referred_user_id, is_paid) VALUES ($1, $2, true)',
+            [referrerId, result.rows[0].id]
+          );
+          
+          await pool.query(
+            'UPDATE users SET wallet_balance = wallet_balance + 3.00, total_earned = total_earned + 3.00, total_referrals = total_referrals + 1 WHERE id = $1',
+            [referrerId]
+          );
+          
+          const newBalance = await pool.query('SELECT wallet_balance FROM users WHERE id = $1', [referrerId]);
+          await pool.query(
+            `INSERT INTO transactions (user_id, type, amount, balance_after, description) 
+             VALUES ($1, 'referral_bonus', 3.00, $2, 'Referral bonus')`,
+            [referrerId, newBalance.rows[0].wallet_balance]
+          );
+        }
+      }
+      
+      await pool.query('COMMIT');
+    } else {
+      await pool.query('UPDATE users SET last_login = NOW() WHERE id = $1', [user.rows[0].id]);
+    }
+
+    const token = jwt.sign({ userId: user.rows[0].id }, process.env.JWT_SECRET, { expiresIn: '30d' });
+    
+    res.json({ token, user: user.rows[0] });
+  } catch (err) {
+    await pool.query('ROLLBACK');
+    console.error('Device auth error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ========== AD VIEWING ROUTES ==========
+
+app.post('/api/ads/start', authenticate, async (req, res) => {
+  try {
+    const { duration } = req.body;
+    const userId = req.userId;
+    
+    if (![15, 30, 45].includes(duration)) {
+      return res.status(400).json({ error: 'Invalid duration' });
+    }
+
+    const today = new Date().toISOString().split('T')[0];
+    let stats = await pool.query(
+      'SELECT * FROM daily_ad_stats WHERE user_id = $1 AND date = $2',
+      [userId, today]
+    );
+
+    if (stats.rows.length === 0) {
+      await pool.query(
+        'INSERT INTO daily_ad_stats (user_id, date) VALUES ($1, $2)',
+        [userId, today]
+      );
+      stats = await pool.query(
+        'SELECT * FROM daily_ad_stats WHERE user_id = $1 AND date = $2',
+        [userId, today]
+      );
+    }
+
+    const dailyStats = stats.rows[0];
+    
+    if (dailyStats.ads_watched >= 30) {
+      return res.status(429).json({ error: 'Daily ad limit reached (30 ads)' });
+    }
+
+    if (parseFloat(dailyStats.total_earned_today) >= 10.00) {
+      return res.status(429).json({ error: 'Daily earning limit reached (10 BDT)' });
+    }
+
+    const sessionToken = crypto.randomBytes(32).toString('hex');
+    const fingerprint = generateFingerprint(req);
+    
+    const rewardMap = { 15: 0.10, 30: 0.30, 45: 0.50 };
+    const reward = rewardMap[duration];
+
+    const result = await pool.query(
+      `INSERT INTO ad_views (user_id, ad_duration, reward_amount, session_token, start_time, ip_address, device_fingerprint)
+       VALUES ($1, $2, $3, $4, NOW(), $5, $6) RETURNING id`,
+      [userId, duration, reward, sessionToken, req.ip, fingerprint]
+    );
+
+    res.json({
+      session_token: sessionToken,
+      ad_view_id: result.rows[0].id,
+      duration,
+      reward
+    });
+  } catch (err) {
+    console.error('Start ad error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/ads/complete', authenticate, async (req, res) => {
+  try {
+    const { session_token, ad_view_id } = req.body;
+    const userId = req.userId;
+
+    const adView = await pool.query(
+      'SELECT * FROM ad_views WHERE id = $1 AND user_id = $2 AND session_token = $3',
+      [ad_view_id, userId, session_token]
+    );
+
+    if (adView.rows.length === 0) {
+      return res.status(404).json({ error: 'Invalid session' });
+    }
+
+    const ad = adView.rows[0];
+
+    if (ad.is_rewarded) {
+      return res.status(400).json({ error: 'Reward already claimed' });
+    }
+
+    const now = new Date();
+    const startTime = new Date(ad.start_time);
+    const elapsed = (now - startTime) / 1000;
+
+    if (elapsed < ad.ad_duration - 2) {
+      await pool.query(
+        'INSERT INTO security_logs (user_id, event_type, details, severity) VALUES ($1, $2, $3, $4)',
+        [userId, 'early_completion', JSON.stringify({ expected: ad.ad_duration, actual: elapsed }), 'medium']
+      );
+      return res.status(400).json({ error: 'Ad not fully watched' });
+    }
+
+    const currentFingerprint = generateFingerprint(req);
+    if (currentFingerprint !== ad.device_fingerprint) {
+      await pool.query(
+        'INSERT INTO security_logs (user_id, event_type, details, severity) VALUES ($1, $2, $3, $4)',
+        [userId, 'fingerprint_mismatch', JSON.stringify({ original: ad.device_fingerprint, current: currentFingerprint }), 'high']
+      );
+    }
+
+    await pool.query('BEGIN');
+
+    await pool.query(
+      'UPDATE ad_views SET end_time = NOW(), is_validated = true, is_rewarded = true WHERE id = $1',
+      [ad_view_id]
+    );
+
+    await pool.query(
+      'UPDATE users SET wallet_balance = wallet_balance + $1, total_earned = total_earned + $1 WHERE id = $2',
+      [ad.reward_amount, userId]
+    );
+
+    const today = new Date().toISOString().split('T')[0];
+    await pool.query(
+      'UPDATE daily_ad_stats SET ads_watched = ads_watched + 1, total_earned_today = total_earned_today + $1 WHERE user_id = $2 AND date = $3',
+      [ad.reward_amount, userId, today]
+    );
+
+    const newBalance = await pool.query('SELECT wallet_balance FROM users WHERE id = $1', [userId]);
+    await pool.query(
+      `INSERT INTO transactions (user_id, type, amount, balance_after, reference_id, description)
+       VALUES ($1, 'ad_reward', $2, $3, $4, $5)`,
+      [userId, ad.reward_amount, newBalance.rows[0].wallet_balance, ad_view_id, `Reward for ${ad.ad_duration}s ad`]
+    );
+
+    await pool.query('COMMIT');
+
+    res.json({
+      success: true,
+      reward: ad.reward_amount,
+      new_balance: parseFloat(newBalance.rows[0].wallet_balance)
+    });
+  } catch (err) {
+    await pool.query('ROLLBACK');
+    console.error('Complete ad error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ========== USER ROUTES ==========
+
+app.get('/api/user/profile', authenticate, async (req, res) => {
+  try {
+    const user = await pool.query('SELECT * FROM users WHERE id = $1', [req.userId]);
+    
+    const today = new Date().toISOString().split('T')[0];
+    const dailyStats = await pool.query(
+      'SELECT * FROM daily_ad_stats WHERE user_id = $1 AND date = $2',
+      [req.userId, today]
+    );
+
+    res.json({
+      user: user.rows[0],
+      daily_stats: dailyStats.rows[0] || { ads_watched: 0, total_earned_today: 0 }
+    });
+  } catch (err) {
+    console.error('Profile error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/user/transactions', authenticate, async (req, res) => {
+  try {
+    const transactions = await pool.query(
+      'SELECT * FROM transactions WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50',
+      [req.userId]
+    );
+    res.json(transactions.rows);
+  } catch (err) {
+    console.error('Transactions error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ========== WITHDRAWAL ROUTES ==========
+
+app.post('/api/withdrawals/request', authenticate, async (req, res) => {
+  try {
+    const { amount, payment_method, account_number } = req.body;
+    
+    if (amount < 300) {
+      return res.status(400).json({ error: 'Minimum withdrawal is 300 BDT' });
+    }
+
+    if (!['bkash', 'nagad'].includes(payment_method)) {
+      return res.status(400).json({ error: 'Invalid payment method' });
+    }
+
+    const user = await pool.query('SELECT wallet_balance FROM users WHERE id = $1', [req.userId]);
+    
+    if (parseFloat(user.rows[0].wallet_balance) < amount) {
+      return res.status(400).json({ error: 'Insufficient balance' });
+    }
+
+    await pool.query('BEGIN');
+
+    await pool.query(
+      `INSERT INTO withdrawal_requests (user_id, amount, payment_method, account_number)
+       VALUES ($1, $2, $3, $4)`,
+      [req.userId, amount, payment_method, account_number]
+    );
+
+    await pool.query(
+      'UPDATE users SET wallet_balance = wallet_balance - $1 WHERE id = $2',
+      [amount, req.userId]
+    );
+
+    await pool.query('COMMIT');
+
+    res.json({ success: true, message: 'Withdrawal request submitted' });
+  } catch (err) {
+    await pool.query('ROLLBACK');
+    console.error('Withdrawal request error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/withdrawals/history', authenticate, async (req, res) => {
+  try {
+    const withdrawals = await pool.query(
+      'SELECT * FROM withdrawal_requests WHERE user_id = $1 ORDER BY requested_at DESC',
+      [req.userId]
+    );
+    res.json(withdrawals.rows);
+  } catch (err) {
+    console.error('Withdrawal history error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ========== ADMIN ROUTES ==========
+
+app.get('/api/admin/users', authenticateAdmin, async (req, res) => {
+  try {
+    const users = await pool.query('SELECT * FROM users ORDER BY created_at DESC LIMIT 100');
+    res.json(users.rows);
+  } catch (err) {
+    console.error('Admin users error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/admin/withdrawals', authenticateAdmin, async (req, res) => {
+  try {
+    const withdrawals = await pool.query(
+      `SELECT w.*, u.username FROM withdrawal_requests w
+       JOIN users u ON w.user_id = u.id
+       ORDER BY w.requested_at DESC LIMIT 100`
+    );
+    res.json(withdrawals.rows);
+  } catch (err) {
+    console.error('Admin withdrawals error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/admin/withdrawals/:id/approve', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    await pool.query('BEGIN');
+    
+    const withdrawal = await pool.query('SELECT * FROM withdrawal_requests WHERE id = $1', [id]);
+    
+    if (withdrawal.rows.length === 0) {
+      await pool.query('ROLLBACK');
+      return res.status(404).json({ error: 'Withdrawal not found' });
+    }
+
+    await pool.query(
+      'UPDATE withdrawal_requests SET status = $1, processed_at = NOW(), processed_by = $2 WHERE id = $3',
+      ['approved', req.adminId, id]
+    );
+    
+    const wd = withdrawal.rows[0];
+    await pool.query(
+      'UPDATE users SET total_withdrawn = total_withdrawn + $1 WHERE id = $2',
+      [wd.amount, wd.user_id]
+    );
+    
+    await pool.query('COMMIT');
+    
+    res.json({ success: true });
+  } catch (err) {
+    await pool.query('ROLLBACK');
+    console.error('Approve withdrawal error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/admin/withdrawals/:id/reject', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reason } = req.body;
+    
+    await pool.query('BEGIN');
+    
+    const withdrawal = await pool.query('SELECT * FROM withdrawal_requests WHERE id = $1', [id]);
+    
+    if (withdrawal.rows.length === 0) {
+      await pool.query('ROLLBACK');
+      return res.status(404).json({ error: 'Withdrawal not found' });
+    }
+
+    await pool.query(
+      'UPDATE withdrawal_requests SET status = $1, admin_notes = $2, processed_at = NOW(), processed_by = $3 WHERE id = $4',
+      ['rejected', reason, req.adminId, id]
+    );
+    
+    const wd = withdrawal.rows[0];
+    await pool.query(
+      'UPDATE users SET wallet_balance = wallet_balance + $1 WHERE id = $2',
+      [wd.amount, wd.user_id]
+    );
+    
+    await pool.query('COMMIT');
+    
+    res.json({ success: true });
+  } catch (err) {
+    await pool.query('ROLLBACK');
+    console.error('Reject withdrawal error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/admin/stats', authenticateAdmin, async (req, res) => {
+  try {
+    const totalUsers = await pool.query('SELECT COUNT(*) as count FROM users');
+    const totalEarned = await pool.query('SELECT SUM(total_earned) as total FROM users');
+    const totalWithdrawn = await pool.query('SELECT SUM(total_withdrawn) as total FROM users');
+    const pendingWithdrawals = await pool.query("SELECT COUNT(*) as count FROM withdrawal_requests WHERE status = 'pending'");
+    
+    const today = new Date().toISOString().split('T')[0];
+    const activeToday = await pool.query('SELECT COUNT(*) as count FROM daily_ad_stats WHERE date = $1', [today]);
+    const adsToday = await pool.query('SELECT SUM(ads_watched) as total FROM daily_ad_stats WHERE date = $1', [today]);
+
+    res.json({
+      total_users: parseInt(totalUsers.rows[0].count),
+      total_earned: parseFloat(totalEarned.rows[0].total || 0),
+      total_withdrawn: parseFloat(totalWithdrawn.rows[0].total || 0),
+      pending_withdrawals: parseInt(pendingWithdrawals.rows[0].count),
+      active_today: parseInt(activeToday.rows[0].count),
+      ads_today: parseInt(adsToday.rows[0].total || 0)
+    });
+  } catch (err) {
+    console.error('Admin stats error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/admin/users/:id/ban', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query('UPDATE users SET is_banned = true WHERE id = $1', [id]);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Ban user error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Start server
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📍 Environment: ${process.env.NODE_ENV || 'development'}`);
+});
